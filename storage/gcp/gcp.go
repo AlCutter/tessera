@@ -59,6 +59,7 @@ import (
 	"github.com/transparency-dev/tessera/internal/otel"
 	"github.com/transparency-dev/tessera/internal/parse"
 	storage "github.com/transparency-dev/tessera/storage/internal"
+
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/api/googleapi"
@@ -902,7 +903,11 @@ func (s *spannerCoordinator) assignEntries(ctx context.Context, entries []*tesse
 			}
 
 			return nil
-		}, spanner.TransactionOptions{TransactionTag: "tessera.op=assignEntries"})
+		}, spanner.TransactionOptions{
+			TransactionTag:         "tessera.op=assignEntries",
+			ReadLockMode:           spannerpb.TransactionOptions_ReadWrite_PESSIMISTIC,
+			BeginTransactionOption: spanner.InlinedBeginTransaction,
+		})
 		span.AddEvent("Finished ReadWriteTransaction")
 
 		if err != nil {
@@ -1034,7 +1039,11 @@ func (s *spannerCoordinator) consumeEntries(ctx context.Context, limit uint64, f
 
 			didWork = true
 			return nil
-		}, spanner.TransactionOptions{TransactionTag: "tessera.op=consumeEntries"})
+		}, spanner.TransactionOptions{
+			TransactionTag:         "tessera.op=consumeEntries",
+			ReadLockMode:           spannerpb.TransactionOptions_ReadWrite_PESSIMISTIC,
+			BeginTransactionOption: spanner.InlinedBeginTransaction,
+		})
 		if err != nil {
 			return false, err
 		}
@@ -1152,7 +1161,11 @@ func (s *spannerCoordinator) publishCheckpoint(ctx context.Context, minStaleActi
 			}
 
 			return nil
-		}, spanner.TransactionOptions{TransactionTag: "tessera.op=publishCheckpoint"}); err != nil {
+		}, spanner.TransactionOptions{
+			TransactionTag:         "tessera.op=publishCheckpoint",
+			ReadLockMode:           spannerpb.TransactionOptions_ReadWrite_PESSIMISTIC,
+			BeginTransactionOption: spanner.InlinedBeginTransaction,
+		}); err != nil {
 			publishCount.Add(ctx, 1, metric.WithAttributes(errorTypeKey.String("error")))
 			return err
 		}
@@ -1221,7 +1234,11 @@ func (s *spannerCoordinator) garbageCollect(ctx context.Context, treeSize uint64
 		}
 
 		return nil
-	}, spanner.TransactionOptions{TransactionTag: "tessera.op=garbageCollect"})
+	}, spanner.TransactionOptions{
+		TransactionTag:         "tessera.op=garbageCollect",
+		ReadLockMode:           spannerpb.TransactionOptions_ReadWrite_PESSIMISTIC,
+		BeginTransactionOption: spanner.InlinedBeginTransaction,
+	})
 	return err
 }
 
