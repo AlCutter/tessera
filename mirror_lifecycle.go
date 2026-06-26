@@ -115,7 +115,7 @@ type MirrorWriter interface {
 	// The provided function f should be called with the contents of the currently published checkpoint,
 	// this will be of zero length if there is no currently published checkpoint, and should
 	// return the new serialised checkpoint or an error. If the function returns an error, the currently
-	// published checkpoint MUST NOT be altered.
+	// published checkpoint MUST NOT be altered, and the returned error MUST be the error returned by f.
 	UpdateCheckpoint(ctx context.Context, f func(oldCP []byte) (newCP []byte, err error)) error
 }
 
@@ -319,7 +319,7 @@ func (mt *MirrorTarget) publishCheckpoint(ctx context.Context, newCP *log.Checkp
 		//  			- Check if upload_end is still greater than or equal to the mirror checkpoint's tree size.
 		// 				- If so, update the mirror checkpoint to the pending checkpoint of size upload_end.
 		// 			If upload_end was too small, the mirror MUST respond with a "409 Conflict" HTTP status
-		//    	code, [with approriate response body].
+		//    	code, [with appropriate response body].
 		// 			Otherwise, if the mirror checkpoint was updated, the mirror MUST respond with a "200 Success"
 		// 			HTTP status code. The response body MUST be formatted as in a witness's successful add-checkpoint
 		// 			response: a sequence of one or more note signature lines.
@@ -346,7 +346,7 @@ func (mt *MirrorTarget) publishCheckpoint(ctx context.Context, newCP *log.Checkp
 
 		return signedNewCPRaw, nil
 	}); err != nil {
-		return nil, retSize, fmt.Errorf("failed to update checkpoint: %v", err)
+		return nil, retSize, fmt.Errorf("failed to update checkpoint: %w", err) // %w as we need to pass ErrConflict back to the caller
 	}
 
 	return retSigs, retSize, nil
@@ -432,7 +432,7 @@ func signNote(n *note.Note, signers ...note.Signer) ([]byte, []byte, error) {
 	return signed, sigs.Bytes(), nil
 }
 
-// isValiSignerdName reports whether name is valid.
+// isValidSignerName reports whether name is valid.
 // It must be non-empty and not have any Unicode spaces or pluses.
 func isValidSignerName(name string) bool {
 	return name != "" && utf8.ValidString(name) && strings.IndexFunc(name, unicode.IsSpace) < 0 && !strings.Contains(name, "+")
