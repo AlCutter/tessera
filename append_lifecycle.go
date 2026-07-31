@@ -18,7 +18,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
+	"net/url"
 	"os"
 	"slices"
 	"sync"
@@ -30,6 +32,7 @@ import (
 	f_log "github.com/transparency-dev/formats/log"
 	"github.com/transparency-dev/merkle/rfc6962"
 	"github.com/transparency-dev/tessera/api/layout"
+	m_gateway "github.com/transparency-dev/tessera/internal/mirror/gateway"
 	"github.com/transparency-dev/tessera/internal/otel"
 	"github.com/transparency-dev/tessera/internal/parse"
 	"github.com/transparency-dev/tessera/internal/witness"
@@ -729,8 +732,37 @@ func (o *AppendOptions) WithAntispam(inMemEntries uint, as Antispam) *AppendOpti
 	return o
 }
 
+// parseURLs parses the provided list of URL strings into a list of URL objects.
+func parseURLs(us []string) ([]*url.URL, error) {
+	ret := make([]*url.URL, 0, len(us))
+	for _, u := range us {
+		parsed, err := url.Parse(u)
+		if err != nil {
+			return nil, err
+		}
+		ret = append(ret, parsed)
+	}
+	return ret, nil
+}
+
 // CheckpointPublisher returns a function which should be used to create, sign, and potentially witness a new checkpoint.
 func (o AppendOptions) CheckpointPublisher(lr LogReader, httpClient *http.Client) func(context.Context, uint64, []byte) ([]byte, error) {
+	urls, err := parseURLs(slices.Collect(maps.Keys(o.mirrors.WitnessEndpoints())))
+	if err != nil {
+		panic("failed to parse mirror URLs")
+	}
+	mg, err := m_gateway.NewGateway(context.Background(), m_gateway.Options{
+		HTTPClient: httpClient,
+		Mirrors:    urls,
+		LogReader:  lr,
+		LogOrigin:  o.primarySigner.Name(),
+	})
+	if err != nil {
+		return func(_ context.Context, _ uint64, _ []byte) ([]byte, error) {
+			return nil, fmt.Errorf("failed to create mirror gateway: %v", err)
+		}
+	}
+
 	return func(ctx context.Context, size uint64, root []byte) ([]byte, error) {
 		return otel.Trace(ctx, "tessera.CheckpointPublisher", tracer, func(ctx context.Context, span trace.Span) ([]byte, error) {
 			cp, err := o.newCP(ctx, size, root)
@@ -749,7 +781,7 @@ func (o AppendOptions) CheckpointPublisher(lr LogReader, httpClient *http.Client
 			})
 			eg.Go(func() error {
 				var err error
-				ms, err = mirrorCheckpoint(ctx, cp, size, o.mirrors, lr, httpClient, o.mirrorOpts)
+				ms, err = mirrorCheckpoint(ctx, mg, cp, size, o.mirrors, o.mirrorOpts)
 				return err
 			})
 
@@ -814,12 +846,24 @@ func witnessCheckpoint(ctx context.Context, cp []byte, cpSize uint64, witnesses 
 
 // mirrorCheckpoint takes care of mirroring the given checkpoint with the provided mirror policy.
 // Returns signatures from mirrors, ready to append to the checkpoint, or an error.
-func mirrorCheckpoint(ctx context.Context, cp []byte, cpSize uint64, mirrors WitnessGroup, lr LogReader, httpClient *http.Client, opts MirroringOptions) ([]byte, error) {
+func mirrorCheckpoint(ctx context.Context, mg *m_gateway.Gateway, cp []byte, cpSize uint64, mirrors WitnessGroup, opts MirroringOptions) ([]byte, error) {
 	return otel.Trace(ctx, "tessera.mirrorCheckpoint", tracer, func(ctx context.Context, span trace.Span) ([]byte, error) {
 		if len(mirrors.Components) == 0 {
 			return nil, nil
 		}
 		span.AddEvent("Starting mirroring")
+		sigs := make([]byte, 0, 1<<20)
+		for sig := range mg.CosignCheckpoint(ctx, cp, cpSize) {
+			sigs = append(sigs, sig...)
+			if mirrors.Satisfied(append(slices.Clone(cp), sigs...)) {
+				return sigs, nil
+			}
+		}
+		if !opts.FailOpen {
+			return nil, witness.ErrPolicyNotSatisfied
+		}
+
+		slog.WarnContext(ctx, "MirrorGateway: failing-open despite insufficient cosignatures")
 		return nil, nil
 	})
 }
