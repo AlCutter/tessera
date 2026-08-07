@@ -25,6 +25,7 @@ import (
 	"io"
 	"maps"
 	"net/http"
+	"net/url"
 	"os"
 	"slices"
 	"sort"
@@ -35,12 +36,17 @@ import (
 
 	"log/slog"
 
+	"github.com/cenkalti/backoff/v5"
 	"github.com/transparency-dev/tessera/client"
 	"github.com/transparency-dev/tessera/internal/otel"
 	"github.com/transparency-dev/tessera/internal/parse"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/mod/sumdb/note"
+
+	wc "github.com/transparency-dev/witness/client/http"
+	"github.com/transparency-dev/witness/witness"
 )
 
 type contextKey int
@@ -49,6 +55,7 @@ const (
 	antiRecursionCtxKey contextKey = iota
 
 	maxUpdateRecursion = 10
+	maxUpdateRetries   = 5
 )
 
 var (
@@ -92,6 +99,20 @@ func init() {
 
 var ErrPolicyNotSatisfied = errors.New("witness policy was not satisfied")
 
+type Witness struct {
+	URL       *url.URL
+	Verifiers []note.Verifier
+}
+
+type Options struct {
+	// HTTPClient is the HTTP client to use for all HTTP operations, if nil uses the DefaultHTTPClient.
+	HTTPClient *http.Client
+	// Witnesses defines the pool of mirrors to update.
+	Witnesses []Witness
+	// FetchTiles knows how to fetch tiles from the log. Used for building consistency proofs.
+	FetchTiles client.TileFetcherFunc
+}
+
 // WitnessGroup defines a group of witnesses, and a threshold of
 // signatures that must be met for this group to be satisfied.
 // Witnesses within a group should be fungible, e.g. all of the Armored
@@ -113,17 +134,47 @@ type WitnessGroup interface {
 	WitnessEndpoints() map[string][]note.Verifier
 }
 
+// NewGateway returns a Gateway that will send out new checkpoints to witnesses.
+func NewGateway(ctx context.Context, opts Options) (*WitnessGateway, error) {
+	if opts.HTTPClient == nil {
+		slog.WarnContext(ctx, "WitnessGateway: No HTTP client configured, using DefaultHTTPClient")
+		opts.HTTPClient = http.DefaultClient
+	}
+	if opts.FetchTiles == nil {
+		return nil, fmt.Errorf("fetch tiles is required")
+	}
+
+	witnesses := make([]*witnessClient, 0, len(opts.Witnesses))
+	for _, w := range dedup(opts.Witnesses) {
+		if w.URL == nil || w.URL.String() == "" {
+			return nil, fmt.Errorf("no URL for witness")
+		}
+		if len(w.Verifiers) == 0 {
+			return nil, fmt.Errorf("no verifiers for witness %s", w.URL.String())
+		}
+		witnesses = append(witnesses, &witnessClient{
+			url:       w.URL.String(),
+			client:    wc.NewWitness(w.URL, opts.HTTPClient),
+			verifiers: w.Verifiers,
+		})
+	}
+	return &WitnessGateway{
+		witnesses: witnesses,
+		fetchTile: opts.FetchTiles,
+	}, nil
+}
+
 // NewWitnessGateway returns a WitnessGateway that will send out new checkpoints to witnesses
 // in the group, and will ensure that the policy is satisfied before returning. All outbound
 // requests will be done using the given client. The tile fetcher is used for constructing
 // consistency proofs for the witnesses.
 func NewWitnessGateway(group WitnessGroup, client *http.Client, oldSize uint64, fetchTiles client.TileFetcherFunc) WitnessGateway {
 	endpoints := group.WitnessEndpoints()
-	witnesses := make([]*witnessClient, 0, len(endpoints))
+	witnesses := make([]*legacyWitnessClient, 0, len(endpoints))
 	for u, vs := range endpoints {
 		vs := dedupVerifiers(vs)
 		if len(vs) > 0 {
-			witnesses = append(witnesses, &witnessClient{
+			witnesses = append(witnesses, &legacyWitnessClient{
 				client: client,
 				// Can't use path.Join here as it'll nobble the double-slash in URLs.
 				// url.JoinPath returns an error, which we can't handle here, but we already know that the URL is valid since
@@ -135,10 +186,44 @@ func NewWitnessGateway(group WitnessGroup, client *http.Client, oldSize uint64, 
 		}
 	}
 	return WitnessGateway{
-		group:     group,
-		witnesses: witnesses,
-		fetchTile: fetchTiles,
+		group:           group,
+		legacyWitnesses: witnesses,
+		fetchTile:       fetchTiles,
 	}
+}
+
+func dedup(ws []Witness) []Witness {
+	// Collapse by URL, grouping verifiers if necessary
+	d := make(map[string]*Witness)
+	for _, w := range ws {
+		if wit, ok := d[w.URL.String()]; !ok {
+			d[w.URL.String()] = &w
+		} else {
+			wit.Verifiers = append(wit.Verifiers, w.Verifiers...)
+		}
+	}
+
+	// Then ensure that we have no duplicate verifiers, within each witness
+	type verifierKey struct {
+		name string
+		hash uint32
+	}
+
+	out := make([]Witness, 0, len(d))
+	for _, w := range d {
+		seen := make(map[verifierKey]bool)
+		vs := make([]note.Verifier, 0, len(w.Verifiers))
+		for _, v := range w.Verifiers {
+			k := verifierKey{name: v.Name(), hash: v.KeyHash()}
+			if !seen[k] {
+				seen[k] = true
+				vs = append(vs, v)
+			}
+		}
+		w.Verifiers = vs
+		out = append(out, *w)
+	}
+	return out
 }
 
 // dedupVerifiers removes duplicate verifiers (identified by name and keyhash) from the given slice.
@@ -163,9 +248,10 @@ func dedupVerifiers(vs []note.Verifier) []note.Verifier {
 
 // WitnessGateway allows a log implementation to send out a checkpoint to witnesses.
 type WitnessGateway struct {
-	group     WitnessGroup
-	witnesses []*witnessClient
-	fetchTile client.TileFetcherFunc
+	group           WitnessGroup
+	legacyWitnesses []*legacyWitnessClient
+	witnesses       []*witnessClient
+	fetchTile       client.TileFetcherFunc
 }
 
 // Witness sends out a new checkpoint (which must be signed by the log), to all witnesses
@@ -173,7 +259,7 @@ type WitnessGateway struct {
 // is Satisfied.
 func (wg *WitnessGateway) Witness(ctx context.Context, cp []byte) ([]byte, error) {
 	return otel.Trace(ctx, "tessera.witnessgateway.Witness", tracer, func(ctx context.Context, span trace.Span) ([]byte, error) {
-		if len(wg.witnesses) == 0 {
+		if len(wg.legacyWitnesses) == 0 {
 			return nil, nil
 		}
 		ctx, cancel := context.WithCancel(ctx)
@@ -198,15 +284,15 @@ func (wg *WitnessGateway) Witness(ctx context.Context, cp []byte) ([]byte, error
 			sig []byte
 			err error
 		}
-		results := make(chan sigOrErr, len(wg.witnesses))
+		results := make(chan sigOrErr, len(wg.legacyWitnesses))
 
 		// Kick off a goroutine for each witness and send result to results chan
-		for _, w := range wg.witnesses {
+		for _, w := range wg.legacyWitnesses {
 			waitGroup.Add(1)
 			go func() {
 				_ = otel.TraceErr(ctx, "tessera.witnessgateway.Witness.update", tracer, func(ctx context.Context, span trace.Span) error {
 					defer waitGroup.Done()
-					sig, err := w.update(ctx, cp, size, pf.ConsistencyProof)
+					sig, err := w.legacyUpdate(ctx, cp, size, pf.ConsistencyProof)
 					results <- sigOrErr{
 						sig: sig,
 						err: err,
@@ -256,6 +342,66 @@ func (wg *WitnessGateway) Witness(ctx context.Context, cp []byte) ([]byte, error
 	})
 }
 
+// CosignCheckpoint sends out a new checkpoint (which must be signed by the log), to all witnesses
+// and returns gathered cosignatures via the returned channel as soon as they are available.
+// The returned channel will be closed once all requests have completed (successfully or otherwise).
+func (wg *WitnessGateway) CosignCheckpoint(ctx context.Context, cp []byte, cpSize uint64) <-chan []byte {
+	out := make(chan []byte, len(wg.witnesses))
+	ctx, span := tracer.Start(ctx, "tessera.witnessgateway.CosignCheckpoint")
+	defer span.End()
+
+	if len(wg.witnesses) == 0 {
+		close(out)
+		return out
+	}
+
+	pb, err := client.NewProofBuilder(ctx, cpSize, wg.fetchTile)
+	if err != nil {
+		close(out)
+		return out
+	}
+	pf := sharedConsistencyProofFetcher{
+		pb:      pb,
+		toSize:  cpSize,
+		results: make(map[uint64]consistencyFuture),
+	}
+
+	var waitGroup sync.WaitGroup
+
+	// Kick off a goroutine for each witness and send result to results chan
+	for _, w := range wg.witnesses {
+		waitGroup.Add(1)
+		go func() {
+			_ = otel.TraceErr(ctx, "tessera.witnessgateway.CosignCheckpoint.update", tracer, func(ctx context.Context, span trace.Span) error {
+				span.SetAttributes(attribute.String("url", w.url))
+				defer waitGroup.Done()
+				sig, err := w.update(ctx, cp, cpSize, pf.ConsistencyProof)
+				if err != nil {
+					slog.ErrorContext(ctx, "WitnessGateway: failed to update witness", slog.String("url", w.url), slog.Any("error", err))
+					return err
+				}
+				cpWithSig := append(slices.Clone(cp), sig...)
+				if _, err := note.Open(cpWithSig, note.VerifierList(w.verifiers...)); err != nil {
+					slog.ErrorContext(ctx, "WitnessGateway: invalid signature(s) from witness", slog.String("url", w.url), slog.Any("error", err))
+					return err
+				}
+				out <- sig
+				return nil
+			})
+		}()
+	}
+
+	go func() {
+		_ = otel.TraceErr(ctx, "tessera.witnessgateway.CosignCheckpoint.closer", tracer, func(ctx context.Context, span trace.Span) error {
+			waitGroup.Wait()
+			close(out)
+			return nil
+		})
+	}()
+
+	return out
+}
+
 type consistencyFuture func() ([][]byte, error)
 
 // sharedConsistencyProofFetcher is a thread-safe caching wrapper around a proof builder.
@@ -286,18 +432,24 @@ func (pf *sharedConsistencyProofFetcher) ConsistencyProof(ctx context.Context, s
 	return f()
 }
 
-// witnessClient is the log's model of a witness's view of this log.
-// It has a URL which is the address to which updates to this log's state can be posted to the witness,
-// using the https://github.com/C2SP/C2SP/blob/main/tlog-witness.md spec.
-// It also has the size of the checkpoint that the log thinks that the witness last signed.
-// This is important for sending update proofs.
-// This is defaulted to zero on startup and calibrated after the first request, which is expected by the spec:
-// `If a client doesn't have information on the latest cosigned checkpoint, it MAY initially make a request with an old size of zero to obtain it`
-type witnessClient struct {
+// legacyWitnessClient is the log's model of a witness's view of this log.
+type legacyWitnessClient struct {
 	client    *http.Client
 	url       string
 	verifiers []note.Verifier
 	size      uint64
+}
+
+// witnessClient is the log's model of a witness's view of this log.
+type witnessClient struct {
+	url string
+	// client is the witness client to use to talk to this witness.
+	client wc.Witness
+	// verifiers are verifiers for the signature(s) returned by the witness.
+	verifiers []note.Verifier
+	// oldSize is the size of the checkpoint that the log thinks that the witness last signed.
+	// This can be zero, in which case the tlog-witness protocol discovery mechanism is used to determine the old size.
+	oldSize uint64
 }
 
 // names returns a string with unique names of the verifiers, sorted.
@@ -311,7 +463,7 @@ func names(w []note.Verifier) []string {
 	return s
 }
 
-func (w *witnessClient) update(ctx context.Context, cp []byte, size uint64, fetchProof func(ctx context.Context, from, to uint64) ([][]byte, error)) ([]byte, error) {
+func (w *legacyWitnessClient) legacyUpdate(ctx context.Context, cp []byte, size uint64, fetchProof func(ctx context.Context, from, to uint64) ([][]byte, error)) ([]byte, error) {
 	return otel.Trace(ctx, "tessera.witness.update", tracer, func(ctx context.Context, span trace.Span) ([]byte, error) {
 		witNames := names(w.verifiers)
 		var recursed uint
@@ -398,7 +550,7 @@ func (w *witnessClient) update(ctx context.Context, cp []byte, size uint64, fetc
 				w.size = newWitSize
 				// Witnesses could cause this recursion to go on for longer than expected if they keep triggering this case.
 				// This is why we pass the context with an incrementing value to detect this unlikely case.
-				return w.update(context.WithValue(ctx, antiRecursionCtxKey, recursed+1), cp, size, fetchProof)
+				return w.legacyUpdate(context.WithValue(ctx, antiRecursionCtxKey, recursed+1), cp, size, fetchProof)
 			}
 
 			// If the old size matches the checkpoint size, the witness MUST check that the root hashes are also identical.
@@ -423,13 +575,59 @@ func (w *witnessClient) update(ctx context.Context, cp []byte, size uint64, fetc
 	})
 }
 
+func (w *witnessClient) update(ctx context.Context, cp []byte, cpSize uint64, fetchProof func(ctx context.Context, from, to uint64) ([][]byte, error)) ([]byte, error) {
+	return otel.Trace(ctx, "tessera.witness.update", tracer, func(ctx context.Context, span trace.Span) ([]byte, error) {
+		witNames := names(w.verifiers)
+		nameAttr := witnessNameKey.String(strings.Join(witNames, ","))
+
+		exp := backoff.NewExponentialBackOff()
+		exp.InitialInterval = 10 * time.Millisecond
+		exp.MaxInterval = 200 * time.Millisecond
+		exp.Multiplier = 2
+
+		return backoff.Retry(ctx, func() ([]byte, error) {
+			var (
+				proof [][]byte
+				err   error
+			)
+			if w.oldSize > 0 {
+				proof, err = fetchProof(ctx, w.oldSize, cpSize)
+				if err != nil {
+					return nil, fmt.Errorf("fetchProof: %v", err)
+				}
+			}
+
+			start := time.Now()
+			witnessClientReqsTotal.Add(ctx, 1, metric.WithAttributes(nameAttr))
+			sigs, actualSize, err := w.client.Update(ctx, w.oldSize, cp, proof)
+			if err != nil {
+				if errors.Is(err, witness.ErrCheckpointStale) {
+					w.oldSize = actualSize
+				}
+				statusAttr := witnessStatusKey.String(err.Error())
+				witnessClientRespsTotal.Add(ctx, 1, metric.WithAttributes(nameAttr, statusAttr))
+				return nil, err
+			}
+			d := time.Since(start)
+			statusAttr := witnessStatusKey.String("success")
+			witnessClientRespsTotal.Add(ctx, 1, metric.WithAttributes(nameAttr, statusAttr))
+			witnessClientReqHistogram.Record(ctx, d.Milliseconds(), metric.WithAttributes(nameAttr, statusAttr))
+			w.oldSize = cpSize
+			return sigs, nil
+		},
+			backoff.WithMaxTries(maxUpdateRetries),
+			backoff.WithBackOff(exp),
+		)
+	})
+}
+
 // buildRequestBody formats the request body for the witness.
 // The request body MUST be a sequence of
 // - a previous size line,
 // - zero or more consistency proof lines,
 // - and an empty line,
 // - followed by a [checkpoint][].
-func (w *witnessClient) buildRequestBody(proof [][]byte, cp []byte) io.Reader {
+func (w *legacyWitnessClient) buildRequestBody(proof [][]byte, cp []byte) io.Reader {
 	var b bytes.Buffer
 	fmt.Fprintf(&b, "old %d\n", w.size)
 
