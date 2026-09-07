@@ -926,6 +926,8 @@ func mirrorCheckpoint(ctx context.Context, cosign cosigSource, mPol policy.TLogP
 }
 
 // cosigSource defines a function that can be called to fetch cosignatures.
+// Implementations should send cosignatures via the returned channel as they become available, and MUST
+// close the channel once no further signatures will be sent, or the context is cancelled.
 type cosigSource func(ctx context.Context, cp []byte, cpSize uint64) <-chan []byte
 
 // errFailedOpen is returned by gatherCosignatures if it did not get sufficient cosignatures to satisfy
@@ -935,8 +937,6 @@ var errFailedOpen = errors.New("failed-open")
 // gatherCosignatures gathers signatures from a source, applying a policy to determine if the signatures are sufficient.
 // It returns a set of signatures which satisfy the policy (potentially more than required if greedy is true), or an error if the policy is not met and failOpen is false.
 func gatherCosignatures(ctx context.Context, name string, fetcher cosigSource, pol policy.TLogPolicy, cp []byte, cpSize uint64, failOpen bool, greedy bool) ([]byte, error) {
-	maxExpectedResponses := len(pol.Witnesses)
-
 	// checkPolicy checks if the provided signatures satisfy the given policy.
 	checkPolicy := func(sigs []byte, failOpen bool) ([]byte, error) {
 		newCP := append(slices.Clone(cp), sigs...)
@@ -955,7 +955,6 @@ func gatherCosignatures(ctx context.Context, name string, fetcher cosigSource, p
 	// or the context is done.
 	collectSigs := func(ctx context.Context, sigCh <-chan []byte) ([]byte, error) {
 		var sigBlock bytes.Buffer
-		gotResponses := 0
 		for {
 			select {
 			case <-ctx.Done():
@@ -966,19 +965,20 @@ func gatherCosignatures(ctx context.Context, name string, fetcher cosigSource, p
 				return sigs, pErr
 			case sig, ok := <-sigCh:
 				if !ok {
-					// No more signatures are coming.
+					// The source has closed the channel, no more signatures will be coming.
+					// So check what we have against the policy, and return accordingly.
 					sigs, pErr := checkPolicy(sigBlock.Bytes(), failOpen)
 					if pErr != nil {
 						pErr = fmt.Errorf("%w: no more signatures available", pErr)
 					}
 					return sigs, pErr
 				}
-				gotResponses++
+
 				sigBlock.Write(sig)
 				// If we're greedy, we need to keep collecting until we've got all the responses
 				// (or the context is cancelled).
 				// Otherwise we can return as soon as we've met the policy.
-				if !greedy || gotResponses == maxExpectedResponses {
+				if !greedy {
 					// Don't allow failOpen here, or we'll break out of the collection loop prematurely.
 					sigs, err := checkPolicy(sigBlock.Bytes(), false)
 					if err == nil {

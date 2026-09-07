@@ -471,11 +471,12 @@ func TestGatherCosignatures(t *testing.T) {
 	sig2 := createCosignature(t, n, testWit2SKey)
 	sig3 := createCosignature(t, n, testWit3SKey)
 
+	timeout := time.Second
+
 	for _, test := range []struct {
 		desc               string
 		policy             policy.TLogPolicy
 		fetcher            func(ctx context.Context, cp []byte, cpSize uint64) <-chan []byte
-		timeout            time.Duration
 		failOpen           bool
 		greedy             bool
 		expectCosignatures []note.Verifier
@@ -487,7 +488,7 @@ func TestGatherCosignatures(t *testing.T) {
 			policy: policy.TLogPolicy{},
 			fetcher: func(ctx context.Context, cp []byte, cpSize uint64) <-chan []byte {
 				ch := make(chan []byte)
-				close(ch)
+				defer close(ch)
 				return ch
 			},
 		},
@@ -513,6 +514,7 @@ func TestGatherCosignatures(t *testing.T) {
 				{key: testWit3VKey, url: "https://wit3.example.com"}}),
 			fetcher: func(ctx context.Context, cp []byte, cpSize uint64) <-chan []byte {
 				ch := make(chan []byte, 3)
+				defer close(ch)
 				ch <- sig1
 				ch <- sig2
 				ch <- sig3
@@ -528,8 +530,8 @@ func TestGatherCosignatures(t *testing.T) {
 				{key: testWit2VKey, url: "https://wit2.example.com"}}),
 			fetcher: func(ctx context.Context, cp []byte, cpSize uint64) <-chan []byte {
 				ch := make(chan []byte, 1)
+				defer close(ch)
 				ch <- sig1
-				close(ch)
 				return ch
 			},
 			greedy:             true,
@@ -542,8 +544,8 @@ func TestGatherCosignatures(t *testing.T) {
 				{key: testWit2VKey, url: "https://wit2.example.com"}}),
 			fetcher: func(ctx context.Context, cp []byte, cpSize uint64) <-chan []byte {
 				ch := make(chan []byte, 1)
+				defer close(ch)
 				ch <- sig1
-				close(ch)
 				return ch
 			},
 			greedy:    true,
@@ -557,8 +559,8 @@ func TestGatherCosignatures(t *testing.T) {
 				{key: testWit2VKey, url: "https://wit2.example.com"}}),
 			fetcher: func(ctx context.Context, cp []byte, cpSize uint64) <-chan []byte {
 				ch := make(chan []byte, 1)
+				defer close(ch)
 				ch <- sig1
-				close(ch)
 				return ch
 			},
 			greedy:             true,
@@ -576,7 +578,6 @@ func TestGatherCosignatures(t *testing.T) {
 				ch <- sig1
 				return ch
 			},
-			timeout:   50 * time.Millisecond,
 			greedy:    true,
 			failOpen:  false,
 			expectErr: true,
@@ -591,7 +592,6 @@ func TestGatherCosignatures(t *testing.T) {
 				ch <- sig1
 				return ch
 			},
-			timeout:            50 * time.Millisecond,
 			greedy:             true,
 			failOpen:           true,
 			expectFailedOpen:   true,
@@ -599,12 +599,8 @@ func TestGatherCosignatures(t *testing.T) {
 		},
 	} {
 		t.Run(test.desc, func(t *testing.T) {
-			ctx := t.Context()
-			if test.timeout > 0 {
-				var cancel context.CancelFunc
-				ctx, cancel = context.WithTimeout(ctx, test.timeout)
-				defer cancel()
-			}
+			ctx, cancel := context.WithTimeout(t.Context(), timeout)
+			defer cancel()
 			sigs, err := gatherCosignatures(ctx, "witness", test.fetcher, test.policy, signedCP, 5, test.failOpen, test.greedy)
 			switch {
 			case test.expectFailedOpen:
