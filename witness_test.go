@@ -729,21 +729,20 @@ func TestWitnessGroup_toPolicy_WitnessNameCollision(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateKey: %v", err)
 	}
-	v1, err := f_note.NewVerifierForCosignatureV1(vKey1)
+	w1URL, _ := url.Parse("https://w1.example.com")
+	w2URL, _ := url.Parse("https://w2.example.com")
+	w1, err := NewWitness(vKey1, w1URL)
 	if err != nil {
-		t.Fatalf("NewVerifierForCosignatureV1: %v", err)
+		t.Fatalf("NewWitness: %v", err)
 	}
-	v2, err := f_note.NewVerifierForCosignatureV1(vKey2)
+	w2, err := NewWitness(vKey2, w2URL)
 	if err != nil {
-		t.Fatalf("NewVerifierForCosignatureV1: %v", err)
+		t.Fatalf("NewWitness: %v", err)
 	}
-	w1 := Witness{vkey: vKey1, Key: v1}
-	w2 := Witness{vkey: vKey2, Key: v2}
-
 	wg := NewWitnessGroup(2, w1, w2)
 	pol, err := wg.toPolicy()
 	if err != nil {
-		t.Fatalf("wg.toPolicy() error = %v", err)
+		t.Fatalf("wg.toPolicy() failed: %v", err)
 	}
 
 	if len(pol.Witnesses) != 2 {
